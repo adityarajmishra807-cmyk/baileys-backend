@@ -70,8 +70,6 @@ async function startSession(sessionId, io) {
     version,
     auth: {
       creds: state.creds,
-      // Caches signal keys in memory on top of the Supabase store — cuts DB
-      // round-trips dramatically for busy sessions (per Baileys docs).
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     logger,
@@ -80,10 +78,7 @@ async function startSession(sessionId, io) {
     generateHighQualityLinkPreview: true,
     syncFullHistory: env.SYNC_FULL_HISTORY,
     markOnlineOnConnect: env.MARK_ONLINE_ON_CONNECT,
-    // Lets Baileys skip a metadata round-trip for groups we already know about.
     cachedGroupMetadata: getCachedGroupMetadataFactory(sessionId),
-    // Needed so Baileys can re-encrypt/resend on retry receipts without you
-    // having to keep every message in RAM.
     getMessage: (key) => loadStoredMessage(sessionId, key.remoteJid, key.id),
   });
 
@@ -97,65 +92,48 @@ async function startSession(sessionId, io) {
   sessions.set(sessionId, entry);
   await sessionRepo.upsert(sessionId, { status: 'connecting' });
 
-  // Persist chats/contacts/messages/groups automatically.
   bindStore(sock, sessionId, logger);
-
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Ignore events from an obsolete socket or an explicitly deleted/stopped
-    // session. This is the critical guard that prevents resurrection.
     const current = sessions.get(sessionId);
-    if (disabledSessions.has(sessionId) || current?.sock !== sock) {
-      return;
-    }
+    if (disabledSessions.has(sessionId) || current?.sock !== sock) return;
 
     if (qr) {
       const qrDataUrl = await QRCode.toDataURL(qr);
-      if (disabledSessions.has(sessionId) || sessions.get(sessionId)?.sock !== sock) {
-        return;
-      }
+      if (disabledSessions.has(sessionId) || sessions.get(sessionId)?.sock !== sock) return;
       await sessionRepo.upsert(sessionId, { status: 'qr', qr: qrDataUrl });
       io?.to(`session:${sessionId}`).emit('qr', { sessionId, qr: qrDataUrl });
       logger.info('QR code generated, waiting for scan');
     }
 
     if (connection === 'open') {
-      const current = sessions.get(sessionId);
-      if (disabledSessions.has(sessionId) || current?.sock !== sock) {
-        return;
-      }
-      current.status = 'open';
-      current.reconnectAttempts = 0;
+      const latest = sessions.get(sessionId);
+      if (disabledSessions.has(sessionId) || latest?.sock !== sock) return;
+      latest.status = 'open';
+      latest.reconnectAttempts = 0;
       await sessionRepo.upsert(sessionId, {
         status: 'open',
         qr: null,
         lastConnectedAt: new Date().toISOString(),
         me: { id: sock.user?.id, name: sock.user?.name },
       });
-      io?.to(`session:${sessionId}`).emit('connection.update', {
-        sessionId,
-        status: 'open',
-        me: sock.user,
-      });
+      io?.to(`session:${sessionId}`).emit('connection.update', { sessionId, status: 'open', me: sock.user });
       logger.info({ me: sock.user }, 'Connection opened');
     }
 
     if (connection === 'close') {
-      const current = sessions.get(sessionId);
-      if (disabledSessions.has(sessionId) || current?.sock !== sock) {
-        return;
-      }
+      const latest = sessions.get(sessionId);
+      if (disabledSessions.has(sessionId) || latest?.sock !== sock) return;
 
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-      current.status = 'close';
-
+      latest.status = 'close';
       await sessionRepo.upsert(sessionId, {
         status: loggedOut ? 'logged_out' : 'close',
         lastDisconnectReason: lastDisconnect?.error?.message || String(statusCode || 'unknown'),
@@ -169,58 +147,37 @@ async function startSession(sessionId, io) {
       if (loggedOut) {
         logger.warn('Session logged out from phone — clearing auth, will not auto-reconnect');
         await clearAuthState(sessionId);
-        if (sessions.get(sessionId)?.sock === sock) {
-          sessions.delete(sessionId);
-        }
+        if (sessions.get(sessionId)?.sock === sock) sessions.delete(sessionId);
         return;
       }
 
-      // Any other close reason (restart required, timed out, connection lost,
-      // etc.) — reconnect with exponential backoff, unless the session was
-      // explicitly disabled/deleted in the meantime.
-      if (disabledSessions.has(sessionId) || sessions.get(sessionId)?.sock !== sock) {
-        return;
-      }
+      if (disabledSessions.has(sessionId) || sessions.get(sessionId)?.sock !== sock) return;
 
-      const attempt = (current.reconnectAttempts || 0) + 1;
-      current.reconnectAttempts = attempt;
+      const attempt = (latest.reconnectAttempts || 0) + 1;
+      latest.reconnectAttempts = attempt;
       const delay = backoffDelay(attempt);
       logger.warn({ attempt, delay, statusCode }, 'Connection closed, reconnecting');
 
       const timer = setTimeout(() => {
         reconnectTimers.delete(sessionId);
-        const latest = sessions.get(sessionId);
-        if (disabledSessions.has(sessionId) || latest?.sock !== sock) {
-          return;
-        }
+        const currentEntry = sessions.get(sessionId);
+        if (disabledSessions.has(sessionId) || currentEntry?.sock !== sock) return;
         startSession(sessionId, io).catch((err) => logger.error({ err }, 'Reconnect failed'));
       }, delay);
-      current.reconnectTimer = timer;
+      latest.reconnectTimer = timer;
       reconnectTimers.set(sessionId, timer);
     }
   });
 
-  // ---- Forward high-frequency / non-persisted events straight to the frontend ----
-  sock.ev.on('presence.update', (presence) => {
-    io?.to(`session:${sessionId}`).emit('presence.update', { sessionId, ...presence });
-  });
-
-  sock.ev.on('messages.upsert', (payload) => {
-    io?.to(`session:${sessionId}`).emit('messages.upsert', { sessionId, ...payload });
-  });
-
-  sock.ev.on('messages.update', (payload) => {
-    io?.to(`session:${sessionId}`).emit('messages.update', { sessionId, payload });
-  });
-
-  sock.ev.on('chats.upsert', (payload) => {
-    io?.to(`session:${sessionId}`).emit('chats.upsert', { sessionId, payload });
-  });
-
-  sock.ev.on('group-participants.update', (payload) => {
-    io?.to(`session:${sessionId}`).emit('group-participants.update', { sessionId, ...payload });
-  });
-
+  // Forward WhatsApp changes to subscribed frontend clients over Socket.IO.
+  sock.ev.on('presence.update', (presence) => io?.to(`session:${sessionId}`).emit('presence.update', { sessionId, ...presence }));
+  sock.ev.on('messages.upsert', (payload) => io?.to(`session:${sessionId}`).emit('messages.upsert', { sessionId, ...payload }));
+  sock.ev.on('messages.update', (payload) => io?.to(`session:${sessionId}`).emit('messages.update', { sessionId, payload }));
+  sock.ev.on('messages.delete', (payload) => io?.to(`session:${sessionId}`).emit('messages.delete', { sessionId, payload }));
+  sock.ev.on('chats.upsert', (payload) => io?.to(`session:${sessionId}`).emit('chats.upsert', { sessionId, payload }));
+  sock.ev.on('chats.update', (payload) => io?.to(`session:${sessionId}`).emit('chats.update', { sessionId, payload }));
+  sock.ev.on('chats.delete', (payload) => io?.to(`session:${sessionId}`).emit('chats.delete', { sessionId, payload }));
+  sock.ev.on('group-participants.update', (payload) => io?.to(`session:${sessionId}`).emit('group-participants.update', { sessionId, ...payload }));
   sock.ev.on('call', (payload) => {
     logger.info({ payload }, 'Incoming call event');
     io?.to(`session:${sessionId}`).emit('call', { sessionId, payload });
@@ -231,8 +188,7 @@ async function startSession(sessionId, io) {
 
 function getSocket(sessionId) {
   const entry = sessions.get(sessionId);
-  if (!entry?.sock) return null;
-  return entry.sock;
+  return entry?.sock || null;
 }
 
 function requireSocket(sessionId) {
@@ -253,7 +209,6 @@ function listActiveSessions() {
   return Array.from(sessions.entries()).map(([sessionId, v]) => ({ sessionId, status: v.status }));
 }
 
-/** Logs the WhatsApp account out (invalidates the session on WhatsApp's side) and wipes local state. */
 async function logoutSession(sessionId) {
   disabledSessions.add(sessionId);
   const timer = reconnectTimers.get(sessionId);
@@ -261,26 +216,18 @@ async function logoutSession(sessionId) {
     clearTimeout(timer);
     reconnectTimers.delete(sessionId);
   }
-
   const sock = getSocket(sessionId);
   if (sock) {
-    try {
-      await sock.logout();
-    } catch (err) {
-      // already disconnected — fine, we still clean up below
-    }
+    try { await sock.logout(); } catch (err) { /* already disconnected */ }
   }
   sessions.delete(sessionId);
   await clearAuthState(sessionId);
   await sessionRepo.upsert(sessionId, { status: 'logged_out', qr: null });
 }
 
-/** Fully deletes a session's socket + all persisted data (auth, chats, contacts, messages, groups). */
 async function deleteSession(sessionId) {
-  // Set the deletion barrier BEFORE closing the socket. Baileys can emit the
-  // close event asynchronously, so ordering this after sock.end() is unsafe.
+  // Set deletion barrier before closing the socket because the close event is asynchronous.
   disabledSessions.add(sessionId);
-
   const timer = reconnectTimers.get(sessionId);
   if (timer) {
     clearTimeout(timer);
@@ -291,11 +238,7 @@ async function deleteSession(sessionId) {
   if (entry) {
     entry.status = 'stopping';
     entry.reconnectAttempts = 0;
-    try {
-      entry.sock.end(undefined);
-    } catch (err) {
-      /* noop */
-    }
+    try { entry.sock.end(undefined); } catch (err) { /* noop */ }
   }
   sessions.delete(sessionId);
 
@@ -309,12 +252,4 @@ async function deleteSession(sessionId) {
   ]);
 }
 
-module.exports = {
-  startSession,
-  getSocket,
-  requireSocket,
-  getStatus,
-  listActiveSessions,
-  logoutSession,
-  deleteSession,
-};
+module.exports = { startSession, getSocket, requireSocket, getStatus, listActiveSessions, logoutSession, deleteSession };
