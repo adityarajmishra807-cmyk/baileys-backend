@@ -19,8 +19,13 @@ const contactRepo = require('../repositories/contact.repo');
 const groupRepo = require('../repositories/group.repo');
 
 // In-memory registry of live sockets for this process.
-// key: sessionId -> { sock, status, reconnectAttempts }
+// key: sessionId -> { sock, status, reconnectAttempts, reconnectTimer }
 const sessions = new Map();
+
+// Sessions explicitly stopped by the user must never be recreated by a late
+// Baileys connection.update('close') event or by an already scheduled timer.
+const disabledSessions = new Set();
+const reconnectTimers = new Map();
 
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
@@ -37,18 +42,29 @@ async function loadStoredMessage(sessionId, jid, id) {
 /**
  * Starts (or restarts) a WhatsApp connection for `sessionId`.
  * `io` is the Socket.IO server used to push realtime events (qr, connection
- * status, incoming messages, presence, etc) to subscribed frontend clients.
+ * status, incoming messages, presence, etc.) to subscribed frontend clients.
  */
 async function startSession(sessionId, io) {
+  // An explicit start is an intentional user action, so it re-enables a
+  // previously deleted/stopped session ID. Auto-reconnects are guarded below.
+  disabledSessions.delete(sessionId);
+
   const logger = getSessionLogger(sessionId);
   const existing = sessions.get(sessionId);
-  if (existing?.sock && existing.status === 'open') {
-    logger.info('Session already connected, skipping start');
+  if (existing?.sock && (existing.status === 'open' || existing.status === 'connecting')) {
+    logger.info('Session already active, skipping duplicate start');
     return existing.sock;
   }
 
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
   const { version } = await fetchLatestBaileysVersion();
+
+  // The session may have been deleted while the async auth/version work was
+  // in progress. Do not recreate anything in that case.
+  if (disabledSessions.has(sessionId)) {
+    logger.info('Session start aborted because it was disabled during setup');
+    return null;
+  }
 
   const sock = makeWASocket({
     version,
@@ -71,7 +87,14 @@ async function startSession(sessionId, io) {
     getMessage: (key) => loadStoredMessage(sessionId, key.remoteJid, key.id),
   });
 
-  sessions.set(sessionId, { sock, status: 'connecting', reconnectAttempts: 0 });
+  if (disabledSessions.has(sessionId)) {
+    try { sock.end(undefined); } catch (err) { /* noop */ }
+    logger.info('Session socket closed because it was disabled during startup');
+    return null;
+  }
+
+  const entry = { sock, status: 'connecting', reconnectAttempts: 0, reconnectTimer: null };
+  sessions.set(sessionId, entry);
   await sessionRepo.upsert(sessionId, { status: 'connecting' });
 
   // Persist chats/contacts/messages/groups automatically.
@@ -81,19 +104,31 @@ async function startSession(sessionId, io) {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    const entry = sessions.get(sessionId) || {};
+
+    // Ignore events from an obsolete socket or an explicitly deleted/stopped
+    // session. This is the critical guard that prevents resurrection.
+    const current = sessions.get(sessionId);
+    if (disabledSessions.has(sessionId) || current?.sock !== sock) {
+      return;
+    }
 
     if (qr) {
       const qrDataUrl = await QRCode.toDataURL(qr);
+      if (disabledSessions.has(sessionId) || sessions.get(sessionId)?.sock !== sock) {
+        return;
+      }
       await sessionRepo.upsert(sessionId, { status: 'qr', qr: qrDataUrl });
       io?.to(`session:${sessionId}`).emit('qr', { sessionId, qr: qrDataUrl });
       logger.info('QR code generated, waiting for scan');
     }
 
     if (connection === 'open') {
-      entry.status = 'open';
-      entry.reconnectAttempts = 0;
-      sessions.set(sessionId, entry);
+      const current = sessions.get(sessionId);
+      if (disabledSessions.has(sessionId) || current?.sock !== sock) {
+        return;
+      }
+      current.status = 'open';
+      current.reconnectAttempts = 0;
       await sessionRepo.upsert(sessionId, {
         status: 'open',
         qr: null,
@@ -109,13 +144,17 @@ async function startSession(sessionId, io) {
     }
 
     if (connection === 'close') {
+      const current = sessions.get(sessionId);
+      if (disabledSessions.has(sessionId) || current?.sock !== sock) {
+        return;
+      }
+
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-      entry.status = 'close';
-      sessions.set(sessionId, entry);
+      current.status = 'close';
 
       await sessionRepo.upsert(sessionId, {
         status: loggedOut ? 'logged_out' : 'close',
@@ -130,18 +169,34 @@ async function startSession(sessionId, io) {
       if (loggedOut) {
         logger.warn('Session logged out from phone — clearing auth, will not auto-reconnect');
         await clearAuthState(sessionId);
-        sessions.delete(sessionId);
+        if (sessions.get(sessionId)?.sock === sock) {
+          sessions.delete(sessionId);
+        }
         return;
       }
 
       // Any other close reason (restart required, timed out, connection lost,
-      // etc.) — reconnect with exponential backoff, per Baileys guidance.
-      const attempt = (entry.reconnectAttempts || 0) + 1;
-      entry.reconnectAttempts = attempt;
-      sessions.set(sessionId, entry);
+      // etc.) — reconnect with exponential backoff, unless the session was
+      // explicitly disabled/deleted in the meantime.
+      if (disabledSessions.has(sessionId) || sessions.get(sessionId)?.sock !== sock) {
+        return;
+      }
+
+      const attempt = (current.reconnectAttempts || 0) + 1;
+      current.reconnectAttempts = attempt;
       const delay = backoffDelay(attempt);
       logger.warn({ attempt, delay, statusCode }, 'Connection closed, reconnecting');
-      setTimeout(() => startSession(sessionId, io).catch((err) => logger.error({ err }, 'Reconnect failed')), delay);
+
+      const timer = setTimeout(() => {
+        reconnectTimers.delete(sessionId);
+        const latest = sessions.get(sessionId);
+        if (disabledSessions.has(sessionId) || latest?.sock !== sock) {
+          return;
+        }
+        startSession(sessionId, io).catch((err) => logger.error({ err }, 'Reconnect failed'));
+      }, delay);
+      current.reconnectTimer = timer;
+      reconnectTimers.set(sessionId, timer);
     }
   });
 
@@ -200,6 +255,13 @@ function listActiveSessions() {
 
 /** Logs the WhatsApp account out (invalidates the session on WhatsApp's side) and wipes local state. */
 async function logoutSession(sessionId) {
+  disabledSessions.add(sessionId);
+  const timer = reconnectTimers.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    reconnectTimers.delete(sessionId);
+  }
+
   const sock = getSocket(sessionId);
   if (sock) {
     try {
@@ -215,15 +277,28 @@ async function logoutSession(sessionId) {
 
 /** Fully deletes a session's socket + all persisted data (auth, chats, contacts, messages, groups). */
 async function deleteSession(sessionId) {
-  const sock = getSocket(sessionId);
-  if (sock) {
+  // Set the deletion barrier BEFORE closing the socket. Baileys can emit the
+  // close event asynchronously, so ordering this after sock.end() is unsafe.
+  disabledSessions.add(sessionId);
+
+  const timer = reconnectTimers.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    reconnectTimers.delete(sessionId);
+  }
+
+  const entry = sessions.get(sessionId);
+  if (entry) {
+    entry.status = 'stopping';
+    entry.reconnectAttempts = 0;
     try {
-      sock.end(undefined);
+      entry.sock.end(undefined);
     } catch (err) {
       /* noop */
     }
   }
   sessions.delete(sessionId);
+
   await Promise.all([
     clearAuthState(sessionId),
     sessionRepo.deleteBySessionId(sessionId),
