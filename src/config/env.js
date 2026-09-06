@@ -11,11 +11,9 @@ const env = {
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
 
   API_KEY: process.env.API_KEY || '',
+  SOCKET_TOKEN_SECRET: process.env.SOCKET_TOKEN_SECRET || process.env.API_KEY || '',
 
-  // Supabase (auth state + chats/contacts/messages/groups persistence)
   SUPABASE_URL: process.env.SUPABASE_URL || '',
-  // Server-side only — the service role key bypasses RLS, so it must never
-  // be exposed to a browser/frontend. Use the anon/public key on the client.
   SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
 
   REDIS_ENABLED: bool(process.env.REDIS_ENABLED, false),
@@ -31,13 +29,11 @@ const env = {
 };
 
 if (env.NODE_ENV === 'production' && !env.API_KEY) {
-  // eslint-disable-next-line no-console
   console.error('FATAL: API_KEY must be set in production. Refusing to start with an open API.');
   process.exit(1);
 }
 
 if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
-  // eslint-disable-next-line no-console
   console.error('FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set.');
   process.exit(1);
 }
