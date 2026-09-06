@@ -1,29 +1,16 @@
 const { Server } = require('socket.io');
 const env = require('../config/env');
 const { rootLogger } = require('../config/logger');
+const { verifyToken } = require('./token');
 
-/**
- * Frontend clients connect, authenticate (same API key as the REST API),
- * then `join` the room for whichever session(s) they want realtime updates
- * for. sessionManager emits events into `session:<id>` rooms — see
- * src/baileys/sessionManager.js.
- */
 function initSocketIO(httpServer) {
   const io = new Server(httpServer, {
     cors: { origin: env.CORS_ORIGIN },
   });
 
   if (env.REDIS_ENABLED) {
-    // Lets Socket.IO broadcast `session:<id>` room events across multiple
-    // Node processes/pods — needed once you run more than one instance.
-    // Note: WhatsApp sockets themselves still live in-process (see
-    // sessionManager's in-memory `sessions` map), so pin each sessionId to a
-    // single instance (e.g. consistent hashing at your load balancer) even
-    // with this adapter in place.
     try {
-      // eslint-disable-next-line global-require
       const { createAdapter } = require('@socket.io/redis-adapter');
-      // eslint-disable-next-line global-require
       const IORedis = require('ioredis');
       const pubClient = new IORedis(env.REDIS_URL);
       const subClient = pubClient.duplicate();
@@ -35,9 +22,18 @@ function initSocketIO(httpServer) {
   }
 
   io.use((socket, next) => {
-    if (!env.API_KEY) return next(); // dev convenience
-    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    if (token !== env.API_KEY) return next(new Error('Unauthorized'));
+    if (!env.API_KEY) return next();
+
+    const apiToken = socket.handshake.auth?.token || socket.handshake.query?.token;
+    if (apiToken === env.API_KEY) {
+      socket.data.allowedSessions = null; // trusted server-side API client
+      return next();
+    }
+
+    const realtime = verifyToken(socket.handshake.auth?.realtimeToken);
+    if (!realtime) return next(new Error('Unauthorized'));
+    socket.data.allowedSessions = realtime.sessionIds;
+    socket.data.realtimeTokenExpiresAt = realtime.exp;
     return next();
   });
 
@@ -45,7 +41,11 @@ function initSocketIO(httpServer) {
     rootLogger.info({ socketId: socket.id }, 'Socket.IO client connected');
 
     socket.on('join', (sessionId) => {
-      if (typeof sessionId !== 'string') return;
+      if (typeof sessionId !== 'string' || !sessionId) return;
+      if (socket.data.allowedSessions && !socket.data.allowedSessions.has(sessionId)) {
+        socket.emit('socket.error', { error: 'Session is not authorized for this realtime connection.' });
+        return;
+      }
       socket.join(`session:${sessionId}`);
       socket.emit('joined', { sessionId });
     });
