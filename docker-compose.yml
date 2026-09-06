@@ -1,0 +1,31 @@
+version: '3.8'
+
+# Note: Supabase is a hosted/managed Postgres service (or your own
+# self-hosted Supabase stack) — it isn't run as a container here. Set
+# SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in your .env file (see
+# .env.example) and apply supabase/schema.sql to that project before
+# starting the app.
+
+services:
+  app:
+    build: .
+    ports:
+      - '8000:8000'
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    volumes:
+      - media_data:/app/storage/media
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    restart: unless-stopped
+
+volumes:
+  media_data:
