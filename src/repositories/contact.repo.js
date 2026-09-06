@@ -15,6 +15,17 @@ function toCamel(row) {
   };
 }
 
+// src/repositories/contact.repo.js
+async function findOne(sessionId, jid) {
+  const result = await supabase
+    .from('contacts')
+    .select('*')
+    .eq('session_id', sessionId)
+    .eq('jid', jid)
+    .maybeSingle();
+  return toCamel(unwrap(result, 'contacts.findOne'));
+}
+
 /** Full upsert (contacts.upsert). */
 async function upsertMany(sessionId, contacts) {
   if (!contacts.length) return;
@@ -67,4 +78,4 @@ async function deleteAllForSession(sessionId) {
   unwrap(result, 'contacts.deleteAllForSession');
 }
 
-module.exports = { upsertMany, upsertPartialMany, findAll, deleteAllForSession };
+module.exports = { upsertMany, upsertPartialMany, findAll, deleteAllForSession, findOne };
