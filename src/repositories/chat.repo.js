@@ -1,10 +1,23 @@
 const { supabase, unwrap } = require('../config/supabase');
 
+function extractPhoneNumber(row) {
+  const raw = row?.raw;
+  if (!raw || typeof raw !== 'object') return null;
+  const candidates = [raw.pnJid, raw.phoneNumber, raw.phoneNumberJid, raw?.contact?.pnJid, raw?.contact?.phoneNumber];
+  for (const value of candidates) {
+    if (typeof value !== 'string' || !value) continue;
+    if (value.endsWith('@s.whatsapp.net') || value.endsWith('@c.us')) return value.split('@')[0];
+    if (/^\d{6,20}$/.test(value)) return value;
+  }
+  return null;
+}
+
 function toCamel(row) {
   if (!row) return null;
   return {
     sessionId: row.session_id,
     jid: row.jid,
+    phoneNumber: extractPhoneNumber(row),
     name: row.name,
     unreadCount: row.unread_count,
     conversationTimestamp: Number(row.conversation_timestamp),
@@ -38,11 +51,7 @@ async function upsertMany(sessionId, chats) {
   unwrap(result, 'chats.upsertMany');
 }
 
-/**
- * Partial upsert (chats.update) — only overwrites the fields present on each
- * update object, creating the row if it doesn't exist yet (mirrors Mongoose's
- * `$set` + `upsert: true` on a subset of fields).
- */
+/** Partial upsert (chats.update). */
 async function upsertPartialMany(sessionId, updates) {
   for (const u of updates) {
     const patch = {};
@@ -70,7 +79,6 @@ async function upsertPartialMany(sessionId, updates) {
   }
 }
 
-/** Bumps last_message_id/conversation_timestamp, creating the chat row (is_group default) if missing. */
 async function touchLastMessage(sessionId, jid, { lastMessageId, conversationTimestamp }) {
   const { data: updated } = await supabase
     .from('chats')
@@ -124,13 +132,4 @@ async function deleteAllForSession(sessionId) {
   unwrap(result, 'chats.deleteAllForSession');
 }
 
-module.exports = {
-  upsertMany,
-  upsertPartialMany,
-  touchLastMessage,
-  findAll,
-  findOne,
-  deleteOne,
-  deleteMany,
-  deleteAllForSession,
-};
+module.exports = { upsertMany, upsertPartialMany, touchLastMessage, findAll, findOne, deleteOne, deleteMany, deleteAllForSession };
