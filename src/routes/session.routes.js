@@ -4,6 +4,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { sessionLimiter } = require('../middleware/rateLimiters');
 
 router.get('/', asyncHandler(ctrl.list));
+router.post('/realtime-token', sessionLimiter, asyncHandler(ctrl.realtimeToken));
 router.post('/:sessionId/start', sessionLimiter, asyncHandler(ctrl.start));
 router.get('/:sessionId/status', asyncHandler(ctrl.status));
 router.post('/:sessionId/logout', sessionLimiter, asyncHandler(ctrl.logout));
