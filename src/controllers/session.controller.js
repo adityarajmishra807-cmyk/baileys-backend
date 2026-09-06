@@ -1,6 +1,7 @@
 const sessionManager = require('../baileys/sessionManager');
 const sessionRepo = require('../repositories/session.repo');
 const { getSessionLogger } = require('../config/logger');
+const { createToken } = require('../sockets/token');
 
 async function start(req, res) {
   const { sessionId } = req.params;
@@ -30,6 +31,13 @@ async function list(req, res) {
   res.json({ success: true, data: docs });
 }
 
+async function realtimeToken(req, res) {
+  const ids = Array.isArray(req.body?.sessionIds) ? req.body.sessionIds : [];
+  const sessionIds = ids.filter((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(id));
+  if (!sessionIds.length) return res.status(400).json({ success: false, error: 'sessionIds must contain at least one valid session ID' });
+  res.json({ success: true, data: { token: createToken(sessionIds) } });
+}
+
 async function logout(req, res) {
   const { sessionId } = req.params;
   await sessionManager.logoutSession(sessionId);
@@ -42,13 +50,12 @@ async function remove(req, res) {
   res.json({ success: true, message: 'Session and all its data deleted' });
 }
 
-/** Checks whether phone numbers are registered on WhatsApp — uses Baileys' onWhatsApp (USync query under the hood). */
 async function checkNumbers(req, res) {
   const { sessionId } = req.params;
-  const { numbers } = req.body; // array of E.164-ish numbers, no +
+  const { numbers } = req.body;
   const sock = sessionManager.requireSocket(sessionId);
   const results = await sock.onWhatsApp(...numbers);
   res.json({ success: true, data: results });
 }
 
-module.exports = { start, status, list, logout, remove, checkNumbers };
+module.exports = { start, status, list, realtimeToken, logout, remove, checkNumbers };
