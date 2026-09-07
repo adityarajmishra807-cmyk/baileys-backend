@@ -13,13 +13,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-      - run: npm ci
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
       - name: Syntax check backend
         run: |
           node --check src/app.js
+          node --check src/baileys/baileys.js
           node --check src/baileys/authState.js
           node --check src/baileys/sessionManager.js
+          node --check src/baileys/store.js
           node --check src/controllers/chat.controller.js
+          node --check src/repositories/authKey.repo.js
           node --check src/repositories/chat.repo.js
           node --check src/repositories/lidMapping.repo.js
