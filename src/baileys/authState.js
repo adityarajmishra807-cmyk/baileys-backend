@@ -36,6 +36,17 @@ function enqueueSessionWrite(sessionId, task) {
   });
 }
 
+async function mirrorLidMappings(sessionId, lidEntries) {
+  if (!lidEntries?.length) return;
+  try {
+    await lidMappingRepo.upsertBaileysKeyEntries(sessionId, lidEntries);
+  } catch (err) {
+    // This table is an application/UI identity cache. Baileys' authoritative
+    // Signal key store has already been persisted and must never fail because
+    // the secondary mapping table/network is temporarily unavailable.
+  }
+}
+
 async function useSupabaseAuthState(sessionId) {
   const { initAuthCreds, BufferJSON, proto } = await getBaileys();
   const storedCreds = await authCredsRepo.get(sessionId);
@@ -44,10 +55,16 @@ async function useSupabaseAuthState(sessionId) {
     : initAuthCreds();
 
   // Backfill the application-level identity table from authoritative Baileys
-  // LID mapping keys already persisted before this feature existed.
-  const storedLidKeys = await authKeyRepo.getAllByType(sessionId, 'lid-mapping');
+  // LID mapping keys already persisted before this feature existed. A mapping
+  // cache failure must not prevent the Signal auth state from loading.
+  let storedLidKeys = [];
+  try {
+    storedLidKeys = await authKeyRepo.getAllByType(sessionId, 'lid-mapping');
+  } catch (err) {
+    storedLidKeys = [];
+  }
   if (storedLidKeys.length) {
-    await lidMappingRepo.upsertBaileysKeyEntries(
+    await mirrorLidMappings(
       sessionId,
       storedLidKeys.map((row) => ({
         type: 'lid-mapping',
@@ -97,13 +114,17 @@ async function useSupabaseAuthState(sessionId) {
         }
       }
 
+      // Persist authoritative Signal/app-state keys first. Never let the
+      // application-level LID mapping mirror reject this operation, because
+      // Baileys depends on keys.set completing successfully to advance its
+      // cryptographic state.
       if (entries.length) await authKeyRepo.applyBatch(sessionId, entries);
-      if (lidEntries.length) await lidMappingRepo.upsertBaileysKeyEntries(sessionId, lidEntries);
+      if (lidEntries.length) await mirrorLidMappings(sessionId, lidEntries);
     }),
 
     clear: async () => enqueueSessionWrite(sessionId, async () => {
       await authKeyRepo.clearAll(sessionId);
-      await lidMappingRepo.deleteAllForSession(sessionId);
+      try { await lidMappingRepo.deleteAllForSession(sessionId); } catch (err) { /* secondary cache */ }
     }),
   };
 
@@ -115,8 +136,8 @@ async function clearAuthState(sessionId) {
     await Promise.all([
       authCredsRepo.remove(sessionId),
       authKeyRepo.clearAll(sessionId),
-      lidMappingRepo.deleteAllForSession(sessionId),
     ]);
+    try { await lidMappingRepo.deleteAllForSession(sessionId); } catch (err) { /* secondary cache */ }
   });
 }
 

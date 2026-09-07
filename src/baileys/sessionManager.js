@@ -69,7 +69,7 @@ async function startSessionInternal(sessionId, io) {
     return existing.sock;
   }
 
-  const { makeWASocket, DisconnectReason, makeCacheableSignalKeyStore, Browsers } = await getBaileys();
+  const { makeWASocket, DisconnectReason, makeCacheableSignalKeyStore, Browsers, proto } = await getBaileys();
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
 
   if (disabledSessions.has(sessionId)) {
@@ -87,6 +87,13 @@ async function startSessionInternal(sessionId, io) {
     browser: Browsers.ubuntu('Chrome'),
     generateHighQualityLinkPreview: true,
     syncFullHistory: env.SYNC_FULL_HISTORY,
+    // Baileys' default callback excludes FULL history even when
+    // syncFullHistory is enabled. That means the phone can send the requested
+    // full archive and the socket silently drops it before messaging-history.set.
+    // Accept every history type whenever full history is enabled.
+    shouldSyncHistoryMessage: env.SYNC_FULL_HISTORY
+      ? () => true
+      : ({ syncType }) => syncType !== proto.HistorySync.HistorySyncType.FULL,
     markOnlineOnConnect: env.MARK_ONLINE_ON_CONNECT,
     cachedGroupMetadata: getCachedGroupMetadataFactory(sessionId),
     getMessage: (key) => loadStoredMessage(sessionId, key.remoteJid, key.id),
