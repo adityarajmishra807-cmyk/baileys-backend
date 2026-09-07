@@ -5,10 +5,10 @@
 --   AuthCreds.model.js      -> auth_creds
 --   AuthKey.model.js        -> auth_keys
 --   Session.model.js        -> sessions
---   Chat.model.js            -> chats
---   Contact.model.js         -> contacts
---   GroupMetadata.model.js   -> group_metadata
---   Message.model.js         -> messages
+--   Chat.model.js           -> chats
+--   Contact.model.js        -> contacts
+--   GroupMetadata.model.js  -> group_metadata
+--   Message.model.js        -> messages
 --
 -- Run this once against your Supabase project (SQL editor, or `supabase db
 -- push` / psql with the connection string). Safe to re-run: everything is
@@ -17,8 +17,6 @@
 
 create extension if not exists "pgcrypto";
 
--- Generic trigger to keep `updated_at` current on every UPDATE, mirroring
--- Mongoose's `timestamps: true`.
 create or replace function set_updated_at()
 returns trigger as $$
 begin
@@ -28,7 +26,7 @@ end;
 $$ language plpgsql;
 
 -- ----------------------------------------------------------------------------
--- sessions  (Session.model.js)
+-- sessions
 -- ----------------------------------------------------------------------------
 create table if not exists sessions (
   id                      bigserial primary key,
@@ -50,7 +48,7 @@ create trigger trg_sessions_updated_at
   for each row execute function set_updated_at();
 
 -- ----------------------------------------------------------------------------
--- auth_creds  (AuthCreds.model.js) — one row per session, holds the `creds` blob
+-- auth_creds — one row per session, holds the serialized AuthenticationCreds
 -- ----------------------------------------------------------------------------
 create table if not exists auth_creds (
   id          bigserial primary key,
@@ -66,7 +64,7 @@ create trigger trg_auth_creds_updated_at
   for each row execute function set_updated_at();
 
 -- ----------------------------------------------------------------------------
--- auth_keys  (AuthKey.model.js) — individual Signal protocol key entries
+-- auth_keys — individual Signal protocol key entries
 -- ----------------------------------------------------------------------------
 create table if not exists auth_keys (
   id          bigserial primary key,
@@ -80,6 +78,7 @@ create table if not exists auth_keys (
 );
 
 create index if not exists idx_auth_keys_session on auth_keys (session_id);
+create index if not exists idx_auth_keys_session_type on auth_keys (session_id, type);
 
 drop trigger if exists trg_auth_keys_updated_at on auth_keys;
 create trigger trg_auth_keys_updated_at
@@ -87,7 +86,33 @@ create trigger trg_auth_keys_updated_at
   for each row execute function set_updated_at();
 
 -- ----------------------------------------------------------------------------
--- chats  (Chat.model.js)
+-- lid_mappings — persistent WhatsApp LID <-> phone JID identity map.
+-- The numeric part of an @lid JID is opaque and must never be treated as a
+-- phone number. The map is populated from Baileys history/contact metadata.
+-- ----------------------------------------------------------------------------
+create table if not exists lid_mappings (
+  id          bigserial primary key,
+  session_id  text not null,
+  lid_jid     text not null,
+  phone_jid   text not null,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  unique (session_id, lid_jid),
+  unique (session_id, phone_jid)
+);
+
+create index if not exists idx_lid_mappings_session_lid
+  on lid_mappings (session_id, lid_jid);
+create index if not exists idx_lid_mappings_session_phone
+  on lid_mappings (session_id, phone_jid);
+
+drop trigger if exists trg_lid_mappings_updated_at on lid_mappings;
+create trigger trg_lid_mappings_updated_at
+  before update on lid_mappings
+  for each row execute function set_updated_at();
+
+-- ----------------------------------------------------------------------------
+-- chats
 -- ----------------------------------------------------------------------------
 create table if not exists chats (
   id                       bigserial primary key,
@@ -116,7 +141,7 @@ create trigger trg_chats_updated_at
   for each row execute function set_updated_at();
 
 -- ----------------------------------------------------------------------------
--- contacts  (Contact.model.js)
+-- contacts
 -- ----------------------------------------------------------------------------
 create table if not exists contacts (
   id             bigserial primary key,
@@ -140,7 +165,7 @@ create trigger trg_contacts_updated_at
   for each row execute function set_updated_at();
 
 -- ----------------------------------------------------------------------------
--- group_metadata  (GroupMetadata.model.js)
+-- group_metadata
 -- ----------------------------------------------------------------------------
 create table if not exists group_metadata (
   id                  bigserial primary key,
@@ -149,13 +174,13 @@ create table if not exists group_metadata (
   subject             text default '',
   owner               text,
   description         text default '',
-  participants        jsonb default '[]'::jsonb,   -- [{ id, admin }]
+  participants        jsonb default '[]'::jsonb,
   announce            boolean default false,
   restrict            boolean default false,
   ephemeral_duration  integer default 0,
   raw                 jsonb,
   created_at          timestamptz not null default now(),
-  updated_at          timestamptz not null default now(),
+  updated_at           timestamptz not null default now(),
   unique (session_id, jid)
 );
 
@@ -167,7 +192,7 @@ create trigger trg_group_metadata_updated_at
   for each row execute function set_updated_at();
 
 -- ----------------------------------------------------------------------------
--- messages  (Message.model.js)
+-- messages
 -- ----------------------------------------------------------------------------
 create table if not exists messages (
   id                  bigserial primary key,
@@ -183,7 +208,7 @@ create table if not exists messages (
   media_path          text,
   media_mimetype      text,
   quoted_message_id   text,
-  content             jsonb,        -- raw proto.IWebMessageInfo (JSON-safe)
+  content             jsonb,
   deleted             boolean default false,
   created_at          timestamptz not null default now(),
   updated_at          timestamptz not null default now(),
@@ -200,16 +225,14 @@ create trigger trg_messages_updated_at
 
 -- ----------------------------------------------------------------------------
 -- Row Level Security
---
--- This backend talks to Supabase using the SERVICE ROLE key (server-side
--- only, never exposed to a browser/client), which bypasses RLS entirely. RLS
--- is enabled anyway with no permissive policies, so these tables stay
--- inaccessible if the anon/public key is ever used against them by mistake.
+-- The backend uses the Supabase service-role key, so it bypasses RLS. RLS is
+-- still enabled to prevent accidental public/anon access to backend state.
 -- ----------------------------------------------------------------------------
 alter table sessions        enable row level security;
-alter table auth_creds       enable row level security;
-alter table auth_keys        enable row level security;
-alter table chats            enable row level security;
-alter table contacts         enable row level security;
-alter table group_metadata   enable row level security;
-alter table messages         enable row level security;
+alter table auth_creds      enable row level security;
+alter table auth_keys       enable row level security;
+alter table lid_mappings    enable row level security;
+alter table chats           enable row level security;
+alter table contacts        enable row level security;
+alter table group_metadata  enable row level security;
+alter table messages        enable row level security;
