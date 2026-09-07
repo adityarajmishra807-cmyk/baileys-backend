@@ -22,6 +22,7 @@ const lidMappingRepo = require('../repositories/lidMapping.repo');
 const sessions = new Map();
 const disabledSessions = new Set();
 const reconnectTimers = new Map();
+const startPromises = new Map();
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
 function backoffDelay(attempt) {
@@ -43,7 +44,7 @@ async function persistLidMappings(sessionId, mappings, logger) {
   }
 }
 
-async function startSession(sessionId, io) {
+async function startSessionInternal(sessionId, io) {
   disabledSessions.delete(sessionId);
 
   const logger = getSessionLogger(sessionId);
@@ -209,6 +210,21 @@ async function startSession(sessionId, io) {
   });
 
   return sock;
+}
+
+async function startSession(sessionId, io) {
+  const existingPromise = startPromises.get(sessionId);
+  if (existingPromise) return existingPromise;
+
+  const promise = startSessionInternal(sessionId, io);
+  startPromises.set(sessionId, promise);
+  try {
+    return await promise;
+  } finally {
+    if (startPromises.get(sessionId) === promise) {
+      startPromises.delete(sessionId);
+    }
+  }
 }
 
 function getSocket(sessionId) {
