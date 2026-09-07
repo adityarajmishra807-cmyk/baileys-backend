@@ -24,8 +24,29 @@ function backoffDelay(attempt) {
 
 async function loadStoredMessage(sessionId, jid, id) {
   if (!jid || !id) return undefined;
-  const msg = await messageRepo.findOne(sessionId, jid, id);
-  return msg?.content?.message || undefined;
+
+  // Retry handling may ask for the same message using the PN JID while the
+  // original history event was stored under its LID (or vice versa). Resolve
+  // both identities before giving Baileys an undefined message.
+  const candidates = [jid];
+  try {
+    if (lidMappingRepo.isLidJid(jid)) {
+      const mapping = await lidMappingRepo.findByLid(sessionId, jid);
+      if (mapping?.phone_jid) candidates.push(mapping.phone_jid);
+    } else if (lidMappingRepo.isPhoneJid(jid)) {
+      const mapping = await lidMappingRepo.findByPhone(sessionId, jid);
+      if (mapping?.lid_jid) candidates.push(mapping.lid_jid);
+    }
+  } catch (err) {
+    // Message retry should still try the original JID if the identity table is
+    // temporarily unavailable.
+  }
+
+  for (const candidate of [...new Set(candidates)]) {
+    const msg = await messageRepo.findOne(sessionId, candidate, id);
+    if (msg?.content?.message) return msg.content.message;
+  }
+  return undefined;
 }
 
 async function persistLidMappings(sessionId, mappings, logger) {
@@ -283,8 +304,7 @@ async function shutdownAllSessions() {
     try {
       entry.sock.end(undefined);
     } catch (err) {
-      // Socket may already be closed; the important part is preventing its
-      // connection.update handler from scheduling another reconnect.
+      // Socket may already be closed; disabledSessions prevents reconnect.
     }
     await sessionRepo.upsert(sessionId, { status: 'close' });
   }));
