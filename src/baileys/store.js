@@ -2,6 +2,7 @@ const chatRepo = require("../repositories/chat.repo");
 const contactRepo = require("../repositories/contact.repo");
 const messageRepo = require("../repositories/message.repo");
 const groupRepo = require("../repositories/group.repo");
+const lidMappingRepo = require("../repositories/lidMapping.repo");
 const { saveIncomingMedia } = require("../utils/mediaStorage");
 
 const MEDIA_TYPES = new Set([
@@ -14,8 +15,8 @@ const MEDIA_TYPES = new Set([
 
 // In-process cache of group metadata, keyed by "sessionId:jid".
 // Passed to makeWASocket as `cachedGroupMetadata` so Baileys doesn't have to
-// hit WhatsApp for group participant lists on every send/decrypt — this is
-// the #1 recommended perf optimization in the Baileys docs.
+// hit WhatsApp for group participant lists on every send/decrypt — this is the
+// #1 recommended perf optimization in the Baileys docs.
 const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
 const groupCache = new Map();
 
@@ -47,6 +48,19 @@ function extractMessageType(message) {
   return keys.find((k) => k !== "messageContextInfo") || keys[0] || "unknown";
 }
 
+async function persistContactMappings(sessionId, contacts, logger) {
+  const mappings = (contacts || [])
+    .filter((c) => c?.lid && c?.phoneNumber)
+    .map((c) => ({ lid: c.lid, pn: c.phoneNumber }));
+  if (!mappings.length) return;
+
+  try {
+    await lidMappingRepo.upsertMany(sessionId, mappings);
+  } catch (err) {
+    logger.warn({ err, count: mappings.length }, "contact LID mapping persist failed");
+  }
+}
+
 /**
  * Binds all persistence-relevant Baileys events for a socket to Supabase.
  * This is the "data store" layer replacing the deprecated in-memory store.
@@ -56,15 +70,15 @@ function bindStore(sock, sessionId, logger) {
 
   // ---- Chats ----
   ev.on('chats.upsert', async (chats) => {
-  try {
-    const realChats = chats.filter(
-      (c) => !c.id.endsWith('@broadcast') && !c.id.endsWith('@newsletter')
-    );
-    await chatRepo.upsertMany(sessionId, realChats);
-  } catch (err) {
-    logger.error({ err }, 'chats.upsert persist failed');
-  }
-});
+    try {
+      const realChats = chats.filter(
+        (c) => !c.id.endsWith('@broadcast') && !c.id.endsWith('@newsletter')
+      );
+      await chatRepo.upsertMany(sessionId, realChats);
+    } catch (err) {
+      logger.error({ err }, 'chats.upsert persist failed');
+    }
+  });
 
   ev.on("chats.update", async (updates) => {
     try {
@@ -85,6 +99,10 @@ function bindStore(sock, sessionId, logger) {
   // ---- Contacts ----
   ev.on("contacts.upsert", async (contacts) => {
     try {
+      // Persist the LID mapping before the contact becomes visible to API
+      // consumers. This prevents a frontend refresh during initial sync from
+      // seeing an LID without its already-known phone identity.
+      await persistContactMappings(sessionId, contacts, logger);
       await contactRepo.upsertMany(sessionId, contacts);
     } catch (err) {
       logger.error({ err }, "contacts.upsert persist failed");
@@ -93,6 +111,7 @@ function bindStore(sock, sessionId, logger) {
 
   ev.on("contacts.update", async (updates) => {
     try {
+      await persistContactMappings(sessionId, updates, logger);
       await contactRepo.upsertPartialMany(sessionId, updates);
     } catch (err) {
       logger.error({ err }, "contacts.update persist failed");
@@ -261,18 +280,25 @@ function bindStore(sock, sessionId, logger) {
   // the on-device chat/message/contact history WhatsApp sends over the wire.
   ev.on(
     "messaging-history.set",
-    async ({ chats, contacts, messages, isLatest, syncType }) => {
+    async ({ chats, contacts, messages, isLatest, syncType, lidPnMappings }) => {
       try {
         logger.info(
           {
             chats: chats?.length || 0,
             contacts: contacts?.length || 0,
             messages: messages?.length || 0,
+            lidPnMappings: lidPnMappings?.length || 0,
             isLatest,
             syncType,
           },
           "messaging-history.set received",
         );
+
+        // Persist the authoritative history LID mappings first. Some history
+        // entries are LID-only and cannot be converted without this metadata.
+        if (lidPnMappings?.length) {
+          await lidMappingRepo.upsertMany(sessionId, lidPnMappings);
+        }
         if (chats?.length) ev.emit("chats.upsert", chats);
         if (contacts?.length) ev.emit("contacts.upsert", contacts);
         if (messages?.length)
