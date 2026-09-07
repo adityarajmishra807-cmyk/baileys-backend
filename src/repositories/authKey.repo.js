@@ -1,6 +1,5 @@
 const { supabase, unwrap } = require('../config/supabase');
 
-/** Returns { [keyId]: valueJson } for the requested (type, keyId) pairs. */
 async function getMany(sessionId, type, keyIds) {
   if (!keyIds?.length) return {};
   const result = await supabase
@@ -15,10 +14,15 @@ async function getMany(sessionId, type, keyIds) {
   return out;
 }
 
-/**
- * Applies a batch of key writes/deletes.
- * `entries`: [{ type, keyId, value }] — value === null means delete.
- */
+async function getAllByType(sessionId, type) {
+  const result = await supabase
+    .from('auth_keys')
+    .select('key_id, value')
+    .eq('session_id', sessionId)
+    .eq('type', type);
+  return unwrap(result, 'auth_keys.getAllByType');
+}
+
 async function applyBatch(sessionId, entries) {
   const toUpsert = entries
     .filter((e) => e.value !== null && e.value !== undefined)
@@ -32,9 +36,6 @@ async function applyBatch(sessionId, entries) {
     unwrap(result, 'auth_keys.applyBatch upsert');
   }
 
-  // Postgres/PostgREST has no multi-tuple "delete where (type,key_id) in (...)"
-  // in one call via supabase-js, so deletes (typically rare/few per batch) go
-  // out individually in parallel.
   if (toDelete.length) {
     await Promise.all(
       toDelete.map((e) =>
@@ -54,4 +55,4 @@ async function clearAll(sessionId) {
   unwrap(result, 'auth_keys.clearAll');
 }
 
-module.exports = { getMany, applyBatch, clearAll };
+module.exports = { getMany, getAllByType, applyBatch, clearAll };
