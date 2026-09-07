@@ -1,5 +1,22 @@
 const { supabase, unwrap } = require('../config/supabase');
 
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 250;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function withRetry(operation, label) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (attempt < MAX_RETRIES) await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
+    }
+  }
+  throw lastError || new Error(`${label} failed`);
+}
+
 function normalizeJid(jid) {
   if (typeof jid !== 'string' || !jid) return null;
   const at = jid.indexOf('@');
@@ -30,17 +47,23 @@ function toMappingRow(sessionId, lid, pn) {
 }
 
 async function upsertMany(sessionId, mappings) {
-  const rows = (mappings || [])
-    .map((m) => toMappingRow(sessionId, m?.lid, m?.pn || m?.phoneJid || m?.phoneNumberJid))
-    .filter(Boolean);
+  const unique = new Map();
+  for (const m of mappings || []) {
+    const row = toMappingRow(sessionId, m?.lid, m?.pn || m?.phoneJid || m?.phoneNumberJid);
+    if (row) unique.set(`${row.lid_jid}:${row.phone_jid}`, row);
+  }
+  const rows = [...unique.values()];
   if (!rows.length) return;
 
-  for (const row of rows) {
+  // One batched request is important during initial history sync. The previous
+  // implementation issued one HTTP request per mapping, making a large sync
+  // extremely slow and allowing transient Supabase failures to interrupt it.
+  return withRetry(async () => {
     const result = await supabase
       .from('lid_mappings')
-      .upsert(row, { onConflict: 'session_id,lid_jid' });
+      .upsert(rows, { onConflict: 'session_id,lid_jid' });
     unwrap(result, 'lid_mappings.upsertMany');
-  }
+  }, 'lid_mappings.upsertMany');
 }
 
 async function upsertBaileysKeyEntries(sessionId, entries) {
@@ -48,9 +71,6 @@ async function upsertBaileysKeyEntries(sessionId, entries) {
   for (const entry of entries || []) {
     if (entry?.type !== 'lid-mapping' || typeof entry.keyId !== 'string' || typeof entry.value !== 'string') continue;
 
-    // Baileys persists two entries for every mapping:
-    //   <pnUser>          -> <lidUser>
-    //   <lidUser>_reverse -> <pnUser>
     if (entry.keyId.endsWith('_reverse')) {
       mappings.push({
         lid: userToJid(entry.keyId.slice(0, -'_reverse'.length), 'lid'),
