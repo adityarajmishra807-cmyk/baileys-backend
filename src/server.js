@@ -8,8 +8,6 @@ const sessionRepo = require('./repositories/session.repo');
 const sessionManager = require('./baileys/sessionManager');
 
 async function resumeExistingSessions(io) {
-  // Reconnect every session that wasn't explicitly logged out, so a server
-  // restart/redeploy never forces the user to re-scan the QR code.
   const sessionIds = await sessionRepo.findActiveSessionIds();
   rootLogger.info({ count: sessionIds.length }, 'Resuming existing WhatsApp sessions');
   for (const sessionId of sessionIds) {
@@ -33,17 +31,25 @@ async function main() {
 
   await resumeExistingSessions(io);
 
+  let shuttingDown = false;
   const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     rootLogger.info({ signal }, 'Shutting down gracefully');
-    httpServer.close(() => rootLogger.info('HTTP server closed'));
+
+    // Stop Baileys sockets first. This is critical during nodemon/systemd/
+    // container restarts: the old process must release its WhatsApp Web socket
+    // before the new process starts using the same persisted Signal state.
+    await sessionManager.shutdownAllSessions();
+
     io.close();
-    // Supabase's client is a stateless REST wrapper — no connection/pool to
-    // explicitly close before exiting.
+    await new Promise((resolve) => httpServer.close(resolve));
+    rootLogger.info('HTTP and WhatsApp connections closed');
     process.exit(0);
   };
 
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
   process.on('unhandledRejection', (err) => rootLogger.error({ err }, 'Unhandled promise rejection'));
   process.on('uncaughtException', (err) => rootLogger.error({ err }, 'Uncaught exception'));
 }
