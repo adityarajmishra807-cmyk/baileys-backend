@@ -24,7 +24,9 @@ const env = {
 
   CORS_ORIGIN: process.env.CORS_ORIGIN || '*',
 
-  SYNC_FULL_HISTORY: bool(process.env.SYNC_FULL_HISTORY, false),
+  // Pull the complete WhatsApp inbox history unless explicitly disabled.
+  // This prevents a fresh/reconnected session from only restoring recent chats.
+  SYNC_FULL_HISTORY: bool(process.env.SYNC_FULL_HISTORY, true),
   MARK_ONLINE_ON_CONNECT: bool(process.env.MARK_ONLINE_ON_CONNECT, false),
 };
 
