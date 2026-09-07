@@ -69,8 +69,6 @@ async function startSessionInternal(sessionId, io) {
     markOnlineOnConnect: env.MARK_ONLINE_ON_CONNECT,
     cachedGroupMetadata: getCachedGroupMetadataFactory(sessionId),
     getMessage: (key) => loadStoredMessage(sessionId, key.remoteJid, key.id),
-    // v7 contains the resilient app-state sync and automatic session
-    // recreation logic that the legacy v6 socket lacked.
     enableAutoSessionRecreation: true,
     enableRecentMessageCache: true,
   });
@@ -269,4 +267,39 @@ async function deleteSession(sessionId) {
   ]);
 }
 
-module.exports = { startSession, getSocket, requireSocket, getStatus, listActiveSessions, logoutSession, deleteSession };
+async function shutdownAllSessions() {
+  const entries = Array.from(sessions.entries());
+  for (const [sessionId, entry] of entries) {
+    disabledSessions.add(sessionId);
+    const timer = reconnectTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      reconnectTimers.delete(sessionId);
+    }
+    entry.status = 'stopping';
+  }
+
+  await Promise.allSettled(entries.map(async ([sessionId, entry]) => {
+    try {
+      entry.sock.end(undefined);
+    } catch (err) {
+      // Socket may already be closed; the important part is preventing its
+      // connection.update handler from scheduling another reconnect.
+    }
+    await sessionRepo.upsert(sessionId, { status: 'close' });
+  }));
+
+  sessions.clear();
+  startPromises.clear();
+}
+
+module.exports = {
+  startSession,
+  getSocket,
+  requireSocket,
+  getStatus,
+  listActiveSessions,
+  logoutSession,
+  deleteSession,
+  shutdownAllSessions,
+};
