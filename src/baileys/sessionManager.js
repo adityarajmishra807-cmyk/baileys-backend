@@ -1,16 +1,9 @@
 const QRCode = require('qrcode');
 const { Boom } = require('@hapi/boom');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const {
-  DisconnectReason,
-  makeCacheableSignalKeyStore,
-  Browsers,
-  fetchLatestBaileysVersion,
-} = require('@whiskeysockets/baileys');
-
 const env = require('../config/env');
 const { getSessionLogger } = require('../config/logger');
 const { useSupabaseAuthState, clearAuthState } = require('./authState');
+const { getBaileys } = require('./baileys');
 const { bindStore, getCachedGroupMetadataFactory } = require('./store');
 const sessionRepo = require('../repositories/session.repo');
 const messageRepo = require('../repositories/message.repo');
@@ -30,6 +23,7 @@ function backoffDelay(attempt) {
 }
 
 async function loadStoredMessage(sessionId, jid, id) {
+  if (!jid || !id) return undefined;
   const msg = await messageRepo.findOne(sessionId, jid, id);
   return msg?.content?.message || undefined;
 }
@@ -54,8 +48,8 @@ async function startSessionInternal(sessionId, io) {
     return existing.sock;
   }
 
+  const { makeWASocket, DisconnectReason, makeCacheableSignalKeyStore, Browsers } = await getBaileys();
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
-  const { version } = await fetchLatestBaileysVersion();
 
   if (disabledSessions.has(sessionId)) {
     logger.info('Session start aborted because it was disabled during setup');
@@ -63,7 +57,6 @@ async function startSessionInternal(sessionId, io) {
   }
 
   const sock = makeWASocket({
-    version,
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -76,6 +69,10 @@ async function startSessionInternal(sessionId, io) {
     markOnlineOnConnect: env.MARK_ONLINE_ON_CONNECT,
     cachedGroupMetadata: getCachedGroupMetadataFactory(sessionId),
     getMessage: (key) => loadStoredMessage(sessionId, key.remoteJid, key.id),
+    // v7 contains the resilient app-state sync and automatic session
+    // recreation logic that the legacy v6 socket lacked.
+    enableAutoSessionRecreation: true,
+    enableRecentMessageCache: true,
   });
 
   if (disabledSessions.has(sessionId)) {
@@ -95,24 +92,6 @@ async function startSessionInternal(sessionId, io) {
   // Mirror mapping events/history into Supabase for API/UI identity resolution.
   sock.ev.on('lid-mapping.update', (mapping) => {
     void persistLidMappings(sessionId, [mapping], logger);
-  });
-
-  sock.ev.on('messaging-history.set', ({ lidPnMappings }) => {
-    void persistLidMappings(sessionId, lidPnMappings, logger);
-  });
-
-  sock.ev.on('contacts.upsert', (contacts) => {
-    const mappings = (contacts || [])
-      .filter((c) => c?.lid && c?.phoneNumber)
-      .map((c) => ({ lid: c.lid, pn: c.phoneNumber }));
-    void persistLidMappings(sessionId, mappings, logger);
-  });
-
-  sock.ev.on('contacts.update', (updates) => {
-    const mappings = (updates || [])
-      .filter((c) => c?.lid && c?.phoneNumber)
-      .map((c) => ({ lid: c.lid, pn: c.phoneNumber }));
-    void persistLidMappings(sessionId, mappings, logger);
   });
 
   sock.ev.on('connection.update', async (update) => {
@@ -135,8 +114,6 @@ async function startSessionInternal(sessionId, io) {
       latest.status = 'open';
       latest.reconnectAttempts = 0;
 
-      // WhatsApp supplies the account's own PN and LID after login. Persisting
-      // this pair is important because device-specific LIDs are not phone numbers.
       if (sock.user?.id && sock.user?.lid) {
         await persistLidMappings(sessionId, [{ lid: sock.user.lid, pn: sock.user.id }], logger);
       }
