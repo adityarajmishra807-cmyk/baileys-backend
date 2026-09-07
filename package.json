@@ -16,7 +16,7 @@
     "@hapi/boom": "^10.0.1",
     "@socket.io/redis-adapter": "^8.3.0",
     "@supabase/supabase-js": "^2.45.4",
-    "@whiskeysockets/baileys": "^6.7.18",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
@@ -28,7 +28,7 @@
     "pino-http": "^10.3.0",
     "qrcode": "^1.5.4",
     "socket.io": "^4.8.1",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.7",
