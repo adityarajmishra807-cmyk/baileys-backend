@@ -6,40 +6,21 @@ const lidMappingRepo = require('../repositories/lidMapping.repo');
 
 function resolveDisplayName(chat, contact) {
   if (chat.isGroup) return chat.name || contact?.name || 'Group';
-  return (
-    contact?.name ||
-    contact?.verifiedName ||
-    contact?.notify ||
-    chat.name ||
-    chat.phoneNumber ||
-    chat.jid.split('@')[0]
-  );
+  return contact?.name || contact?.verifiedName || contact?.notify || chat.name || chat.phoneNumber || chat.jid.split('@')[0];
 }
 
 function indexContacts(contacts) {
   const map = new Map();
-  for (const contact of contacts || []) {
-    if (contact?.jid) map.set(contact.jid, contact);
-  }
+  for (const contact of contacts || []) if (contact?.jid) map.set(contact.jid, contact);
   return map;
 }
 
 async function enrichChats(sessionId, rows) {
   if (!rows.length) return [];
 
-  const lidJids = rows
-    .map((chat) => chat.jid)
-    .filter((jid) => lidMappingRepo.isLidJid(jid));
-
+  const lidJids = rows.map((chat) => chat.jid).filter((jid) => lidMappingRepo.isLidJid(jid));
   const mappings = await lidMappingRepo.findManyByLids(sessionId, lidJids);
   const mappingMap = new Map(mappings.map((m) => [m.lid_jid, m]));
-
-  const contactJids = new Set();
-  for (const chat of rows) {
-    contactJids.add(chat.jid);
-    const mapping = mappingMap.get(chat.jid);
-    if (mapping?.phone_jid) contactJids.add(mapping.phone_jid);
-  }
 
   const contacts = await contactRepo.findAll(sessionId);
   const contactMap = indexContacts(contacts);
@@ -49,36 +30,13 @@ async function enrichChats(sessionId, rows) {
     const chat = {
       ...row,
       phoneJid: mapping?.phone_jid || row.phoneJid,
-      phoneNumber: mapping?.phone_jid
-        ? mapping.phone_jid.split('@')[0].split(':')[0]
-        : row.phoneNumber,
+      phoneNumber: mapping?.phone_jid ? mapping.phone_jid.split('@')[0].split(':')[0] : row.phoneNumber,
     };
     const contact = contactMap.get(row.jid) || (mapping?.phone_jid ? contactMap.get(mapping.phone_jid) : null);
-    return {
-      ...chat,
-      displayName: resolveDisplayName(chat, contact),
-    };
+    return { ...chat, displayName: resolveDisplayName(chat, contact) };
   });
 }
 
-async function list(req, res) {
-  const { sessionId } = req.params;
-  const { limit = 50, before } = req.query;
-  const page = await chatRepo.findPage(sessionId, { limit, before });
-  const data = await enrichChats(sessionId, page.rows.map((row) => chatRepoRowToCamel(row)));
-  res.json({
-    success: true,
-    data,
-    pagination: {
-      limit: Math.min(Math.max(Number(limit) || 50, 1), 100),
-      hasMore: page.hasMore,
-      nextCursor: page.nextCursor,
-    },
-  });
-}
-
-// findPage intentionally returns raw rows so mapping-aware normalization can
-// happen in one place without changing the repository's existing findOne API.
 function chatRepoRowToCamel(row) {
   const isLid = row.jid?.endsWith('@lid') || row.jid?.endsWith('@hosted.lid');
   return {
@@ -101,12 +59,25 @@ function chatRepoRowToCamel(row) {
   };
 }
 
+async function list(req, res) {
+  const { sessionId } = req.params;
+  const { limit = 50, before } = req.query;
+  const page = await chatRepo.findPage(sessionId, { limit, before });
+  const data = await enrichChats(sessionId, page.rows.map(chatRepoRowToCamel));
+  res.json({
+    success: true,
+    data,
+    pagination: {
+      limit: Math.min(Math.max(Number(limit) || 50, 1), 100),
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+    },
+  });
+}
+
 async function get(req, res) {
   const { sessionId, jid } = req.params;
-  const [chat, contact] = await Promise.all([
-    chatRepo.findOne(sessionId, jid),
-    contactRepo.findOne(sessionId, jid),
-  ]);
+  const [chat, contact] = await Promise.all([chatRepo.findOne(sessionId, jid), contactRepo.findOne(sessionId, jid)]);
   if (!chat) return res.status(404).json({ success: false, error: 'Chat not found' });
 
   let mapping = null;
@@ -151,10 +122,7 @@ async function clearMessages(req, res) {
   const { sessionId, jid } = req.params;
   const sock = sessionManager.requireSocket(sessionId);
   const msgs = await messageRepo.findAllForChat(sessionId, jid);
-  await sock.chatModify(
-    { clear: true, lastMessages: msgs.map((m) => ({ key: m.content.key, messageTimestamp: m.messageTimestamp })) },
-    jid,
-  );
+  await sock.chatModify({ clear: true, lastMessages: msgs.map((m) => ({ key: m.content.key, messageTimestamp: m.messageTimestamp })) }, jid);
   await messageRepo.deleteAllForChat(sessionId, jid);
   res.json({ success: true });
 }
