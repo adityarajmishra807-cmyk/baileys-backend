@@ -17,36 +17,33 @@ const messageRepo = require('../repositories/message.repo');
 const chatRepo = require('../repositories/chat.repo');
 const contactRepo = require('../repositories/contact.repo');
 const groupRepo = require('../repositories/group.repo');
+const lidMappingRepo = require('../repositories/lidMapping.repo');
 
-// In-memory registry of live sockets for this process.
-// key: sessionId -> { sock, status, reconnectAttempts, reconnectTimer }
 const sessions = new Map();
-
-// Sessions explicitly stopped by the user must never be recreated by a late
-// Baileys connection.update('close') event or by an already scheduled timer.
 const disabledSessions = new Set();
 const reconnectTimers = new Map();
-
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
 function backoffDelay(attempt) {
   return Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
 }
 
-/** Rehydrates a stored, JSON-safe WebMessageInfo back into a message for getMessage/retries. */
 async function loadStoredMessage(sessionId, jid, id) {
   const msg = await messageRepo.findOne(sessionId, jid, id);
   return msg?.content?.message || undefined;
 }
 
-/**
- * Starts (or restarts) a WhatsApp connection for `sessionId`.
- * `io` is the Socket.IO server used to push realtime events (qr, connection
- * status, incoming messages, presence, etc.) to subscribed frontend clients.
- */
+async function persistLidMappings(sessionId, mappings, logger) {
+  if (!Array.isArray(mappings) || mappings.length === 0) return;
+  try {
+    await lidMappingRepo.upsertMany(sessionId, mappings);
+    logger.debug({ count: mappings.length }, 'LID-PN mappings persisted');
+  } catch (err) {
+    logger.warn({ err, count: mappings.length }, 'failed to persist LID-PN mappings');
+  }
+}
+
 async function startSession(sessionId, io) {
-  // An explicit start is an intentional user action, so it re-enables a
-  // previously deleted/stopped session ID. Auto-reconnects are guarded below.
   disabledSessions.delete(sessionId);
 
   const logger = getSessionLogger(sessionId);
@@ -59,8 +56,6 @@ async function startSession(sessionId, io) {
   const { state, saveCreds } = await useSupabaseAuthState(sessionId);
   const { version } = await fetchLatestBaileysVersion();
 
-  // The session may have been deleted while the async auth/version work was
-  // in progress. Do not recreate anything in that case.
   if (disabledSessions.has(sessionId)) {
     logger.info('Session start aborted because it was disabled during setup');
     return null;
@@ -95,6 +90,30 @@ async function startSession(sessionId, io) {
   bindStore(sock, sessionId, logger);
   sock.ev.on('creds.update', saveCreds);
 
+  // Baileys keeps the authoritative LID mapping inside the Signal key store.
+  // Mirror mapping events/history into Supabase for API/UI identity resolution.
+  sock.ev.on('lid-mapping.update', (mapping) => {
+    void persistLidMappings(sessionId, [mapping], logger);
+  });
+
+  sock.ev.on('messaging-history.set', ({ lidPnMappings }) => {
+    void persistLidMappings(sessionId, lidPnMappings, logger);
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    const mappings = (contacts || [])
+      .filter((c) => c?.lid && c?.phoneNumber)
+      .map((c) => ({ lid: c.lid, pn: c.phoneNumber }));
+    void persistLidMappings(sessionId, mappings, logger);
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    const mappings = (updates || [])
+      .filter((c) => c?.lid && c?.phoneNumber)
+      .map((c) => ({ lid: c.lid, pn: c.phoneNumber }));
+    void persistLidMappings(sessionId, mappings, logger);
+  });
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -114,6 +133,13 @@ async function startSession(sessionId, io) {
       if (disabledSessions.has(sessionId) || latest?.sock !== sock) return;
       latest.status = 'open';
       latest.reconnectAttempts = 0;
+
+      // WhatsApp supplies the account's own PN and LID after login. Persisting
+      // this pair is important because device-specific LIDs are not phone numbers.
+      if (sock.user?.id && sock.user?.lid) {
+        await persistLidMappings(sessionId, [{ lid: sock.user.lid, pn: sock.user.id }], logger);
+      }
+
       await sessionRepo.upsert(sessionId, {
         status: 'open',
         qr: null,
@@ -169,7 +195,6 @@ async function startSession(sessionId, io) {
     }
   });
 
-  // Forward WhatsApp changes to subscribed frontend clients over Socket.IO.
   sock.ev.on('presence.update', (presence) => io?.to(`session:${sessionId}`).emit('presence.update', { sessionId, ...presence }));
   sock.ev.on('messages.upsert', (payload) => io?.to(`session:${sessionId}`).emit('messages.upsert', { sessionId, ...payload }));
   sock.ev.on('messages.update', (payload) => io?.to(`session:${sessionId}`).emit('messages.update', { sessionId, payload }));
@@ -194,7 +219,7 @@ function getSocket(sessionId) {
 function requireSocket(sessionId) {
   const sock = getSocket(sessionId);
   if (!sock) {
-    const err = new Error(`Session "${sessionId}" is not connected`);
+    const err = new Error(`Session \"${sessionId}\" is not connected`);
     err.statusCode = 409;
     throw err;
   }
@@ -226,7 +251,6 @@ async function logoutSession(sessionId) {
 }
 
 async function deleteSession(sessionId) {
-  // Set deletion barrier before closing the socket because the close event is asynchronous.
   disabledSessions.add(sessionId);
   const timer = reconnectTimers.get(sessionId);
   if (timer) {
