@@ -15,6 +15,8 @@ jobs:
           node-version: 20
       - name: Install dependencies
         run: npm install --no-audit --no-fund
+      - name: Verify Baileys runtime import
+        run: node -e "require('./src/baileys/baileys').getBaileys().then(m => { if (typeof m.makeWASocket !== 'function') throw new Error('makeWASocket export missing'); console.log('Baileys runtime import OK') })"
       - name: Syntax check backend
         run: |
           node --check src/app.js
