@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Syntax check backend
+        run: |
+          node --check src/app.js
+          node --check src/baileys/authState.js
+          node --check src/baileys/sessionManager.js
+          node --check src/controllers/chat.controller.js
+          node --check src/repositories/chat.repo.js
+          node --check src/repositories/lidMapping.repo.js

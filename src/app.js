@@ -16,9 +16,21 @@ function createApp() {
   app.use(cors({ origin: env.CORS_ORIGIN }));
   app.use(express.json({ limit: '5mb' }));
   app.use(express.urlencoded({ extended: true }));
-  app.use(pinoHttp({ logger: rootLogger, autoLogging: { ignore: (req) => req.url === '/health' } }));
+  app.use(pinoHttp({
+    logger: rootLogger,
+    autoLogging: { ignore: (req) => req.url === '/health' },
+    redact: {
+      paths: [
+        'req.headers.authorization',
+        'req.headers.cookie',
+        'req.headers["x-api-key"]',
+        'req.headers["x-realtime-token"]',
+        'req.headers["set-cookie"]',
+      ],
+      censor: '[REDACTED]',
+    },
+  }));
 
-  // Basic global rate limit — tune per-route if you need stricter limits on /send.
   app.use(
     rateLimit({
       windowMs: 60 * 1000,
