@@ -3,19 +3,26 @@ const authCredsRepo = require('../repositories/authCreds.repo');
 const authKeyRepo = require('../repositories/authKey.repo');
 const lidMappingRepo = require('../repositories/lidMapping.repo');
 
-// Serialize/deserialize through Baileys' BufferJSON replacer/reviver so that
-// Uint8Array/Buffer key material survives the trip through Postgres jsonb.
 const serialize = (data) => JSON.parse(JSON.stringify(data, BufferJSON.replacer));
 const deserialize = (data) => JSON.parse(JSON.stringify(data), BufferJSON.reviver);
 
 /**
  * Database-backed AuthenticationState. Both creds and every Signal key type
- * are persisted; in particular `lid-mapping` is mirrored into lid_mappings so
- * the application layer can resolve @lid JIDs without guessing phone numbers.
+ * are persisted; `lid-mapping` is also mirrored into the application table.
  */
 async function useSupabaseAuthState(sessionId) {
   const storedCreds = await authCredsRepo.get(sessionId);
   const creds = storedCreds ? deserialize(storedCreds) : initAuthCreds();
+
+  // Backfill the application-level identity table from the authoritative
+  // Baileys Signal mapping keys already persisted before this feature existed.
+  const storedLidKeys = await authKeyRepo.getAllByType(sessionId, 'lid-mapping');
+  if (storedLidKeys.length) {
+    await lidMappingRepo.upsertBaileysKeyEntries(
+      sessionId,
+      storedLidKeys.map((row) => ({ type: 'lid-mapping', keyId: row.key_id, value: String(row.value) })),
+    );
+  }
 
   const saveCreds = async () => {
     await authCredsRepo.upsert(sessionId, serialize(creds));
@@ -55,9 +62,7 @@ async function useSupabaseAuthState(sessionId) {
       }
 
       if (entries.length) await authKeyRepo.applyBatch(sessionId, entries);
-      if (lidEntries.length) {
-        await lidMappingRepo.upsertBaileysKeyEntries(sessionId, lidEntries);
-      }
+      if (lidEntries.length) await lidMappingRepo.upsertBaileysKeyEntries(sessionId, lidEntries);
     },
 
     clear: async () => {
@@ -66,13 +71,9 @@ async function useSupabaseAuthState(sessionId) {
     },
   };
 
-  return {
-    state: { creds, keys },
-    saveCreds,
-  };
+  return { state: { creds, keys }, saveCreds };
 }
 
-/** Wipes all persisted auth material for a session — used on logout / delete. */
 async function clearAuthState(sessionId) {
   await Promise.all([
     authCredsRepo.remove(sessionId),
