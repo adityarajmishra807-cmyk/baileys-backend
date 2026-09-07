@@ -6,6 +6,24 @@ const lidMappingRepo = require('../repositories/lidMapping.repo');
 const serialize = (data) => JSON.parse(JSON.stringify(data, BufferJSON.replacer));
 const deserialize = (data) => JSON.parse(JSON.stringify(data), BufferJSON.reviver);
 
+// Baileys can issue several key mutations concurrently. Supabase upserts are
+// atomic per row, but delete/upsert ordering is still significant for Signal
+// and app-state keys. Serialize persistence per WhatsApp session so a late DB
+// operation can never overwrite a newer state transition.
+const sessionWriteQueues = new Map();
+
+function enqueueSessionWrite(sessionId, task) {
+  const previous = sessionWriteQueues.get(sessionId) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  sessionWriteQueues.set(sessionId, current);
+
+  return current.finally(() => {
+    if (sessionWriteQueues.get(sessionId) === current) {
+      sessionWriteQueues.delete(sessionId);
+    }
+  });
+}
+
 /**
  * Database-backed AuthenticationState. Both creds and every Signal key type
  * are persisted; `lid-mapping` is also mirrored into the application table.
@@ -20,12 +38,17 @@ async function useSupabaseAuthState(sessionId) {
   if (storedLidKeys.length) {
     await lidMappingRepo.upsertBaileysKeyEntries(
       sessionId,
-      storedLidKeys.map((row) => ({ type: 'lid-mapping', keyId: row.key_id, value: String(row.value) })),
+      storedLidKeys.map((row) => ({
+        type: 'lid-mapping',
+        keyId: row.key_id,
+        value: String(row.value),
+      })),
     );
   }
 
   const saveCreds = async () => {
-    await authCredsRepo.upsert(sessionId, serialize(creds));
+    const snapshot = serialize(creds);
+    await enqueueSessionWrite(sessionId, () => authCredsRepo.upsert(sessionId, snapshot));
   };
 
   const keys = {
@@ -42,7 +65,7 @@ async function useSupabaseAuthState(sessionId) {
       return result;
     },
 
-    set: async (data) => {
+    set: async (data) => enqueueSessionWrite(sessionId, async () => {
       const entries = [];
       const lidEntries = [];
 
@@ -63,23 +86,25 @@ async function useSupabaseAuthState(sessionId) {
 
       if (entries.length) await authKeyRepo.applyBatch(sessionId, entries);
       if (lidEntries.length) await lidMappingRepo.upsertBaileysKeyEntries(sessionId, lidEntries);
-    },
+    }),
 
-    clear: async () => {
+    clear: async () => enqueueSessionWrite(sessionId, async () => {
       await authKeyRepo.clearAll(sessionId);
       await lidMappingRepo.deleteAllForSession(sessionId);
-    },
+    }),
   };
 
   return { state: { creds, keys }, saveCreds };
 }
 
 async function clearAuthState(sessionId) {
-  await Promise.all([
-    authCredsRepo.remove(sessionId),
-    authKeyRepo.clearAll(sessionId),
-    lidMappingRepo.deleteAllForSession(sessionId),
-  ]);
+  await enqueueSessionWrite(sessionId, async () => {
+    await Promise.all([
+      authCredsRepo.remove(sessionId),
+      authKeyRepo.clearAll(sessionId),
+      lidMappingRepo.deleteAllForSession(sessionId),
+    ]);
+  });
 }
 
 module.exports = { useSupabaseAuthState, clearAuthState };
