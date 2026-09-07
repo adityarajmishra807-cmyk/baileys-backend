@@ -13,10 +13,6 @@ const MEDIA_TYPES = new Set([
   "stickerMessage",
 ]);
 
-// In-process cache of group metadata, keyed by "sessionId:jid".
-// Passed to makeWASocket as `cachedGroupMetadata` so Baileys doesn't have to
-// hit WhatsApp for group participant lists on every send/decrypt — this is the
-// #1 recommended perf optimization in the Baileys docs.
 const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
 const groupCache = new Map();
 
@@ -27,8 +23,7 @@ function groupCacheKey(sessionId, jid) {
 function getCachedGroupMetadataFactory(sessionId) {
   return async (jid) => {
     const entry = groupCache.get(groupCacheKey(sessionId, jid));
-    if (entry && Date.now() - entry.ts < GROUP_CACHE_TTL_MS)
-      return entry.metadata;
+    if (entry && Date.now() - entry.ts < GROUP_CACHE_TTL_MS) return entry.metadata;
     return undefined;
   };
 }
@@ -38,7 +33,6 @@ function setGroupCache(sessionId, jid, metadata) {
 }
 
 function toJSONSafe(obj) {
-  // Strips proto Long/Buffer weirdness so it stores cleanly in a jsonb column.
   return JSON.parse(JSON.stringify(obj));
 }
 
@@ -61,22 +55,62 @@ async function persistContactMappings(sessionId, contacts, logger) {
   }
 }
 
-/**
- * Binds all persistence-relevant Baileys events for a socket to Supabase.
- * This is the "data store" layer replacing the deprecated in-memory store.
- */
+async function persistHistoryMessages(sessionId, messages) {
+  const entries = [];
+  const chatTouches = [];
+
+  for (const m of messages || []) {
+    if (!m.key?.remoteJid || !m.key?.id) continue;
+    const type = extractMessageType(m);
+    const ts = Number(m.messageTimestamp || Date.now() / 1000);
+
+    entries.push({
+      jid: m.key.remoteJid,
+      messageId: m.key.id,
+      fromMe: !!m.key.fromMe,
+      participant: m.key.participant || m.participant || null,
+      messageTimestamp: ts,
+      messageType: type,
+      mediaPath: null,
+      mediaMimetype: null,
+      quotedMessageId: m.message?.[type]?.contextInfo?.stanzaId || null,
+      content: toJSONSafe(m),
+      status: m.key.fromMe ? "sent" : "delivered",
+    });
+
+    chatTouches.push({
+      jid: m.key.remoteJid,
+      lastMessageId: m.key.id,
+      conversationTimestamp: ts,
+    });
+  }
+
+  if (entries.length) await messageRepo.upsertMany(sessionId, entries);
+
+  // History can contain messages for chats that were not included in the same
+  // history chunk. Touching the chat after message persistence guarantees that
+  // every historical conversation is represented in the chats table.
+  for (const touch of chatTouches) {
+    await chatRepo.touchLastMessage(sessionId, touch.jid, {
+      lastMessageId: touch.lastMessageId,
+      conversationTimestamp: touch.conversationTimestamp,
+    });
+  }
+
+  return entries.length;
+}
+
 function bindStore(sock, sessionId, logger) {
   const ev = sock.ev;
 
-  // ---- Chats ----
-  ev.on('chats.upsert', async (chats) => {
+  ev.on("chats.upsert", async (chats) => {
     try {
       const realChats = chats.filter(
-        (c) => !c.id.endsWith('@broadcast') && !c.id.endsWith('@newsletter')
+        (c) => !c.id.endsWith("@broadcast") && !c.id.endsWith("@newsletter"),
       );
       await chatRepo.upsertMany(sessionId, realChats);
     } catch (err) {
-      logger.error({ err }, 'chats.upsert persist failed');
+      logger.error({ err }, "chats.upsert persist failed");
     }
   });
 
@@ -96,12 +130,8 @@ function bindStore(sock, sessionId, logger) {
     }
   });
 
-  // ---- Contacts ----
   ev.on("contacts.upsert", async (contacts) => {
     try {
-      // Persist the LID mapping before the contact becomes visible to API
-      // consumers. This prevents a frontend refresh during initial sync from
-      // seeing an LID without its already-known phone identity.
       await persistContactMappings(sessionId, contacts, logger);
       await contactRepo.upsertMany(sessionId, contacts);
     } catch (err) {
@@ -118,7 +148,6 @@ function bindStore(sock, sessionId, logger) {
     }
   });
 
-  // ---- Messages ----
   ev.on("messages.upsert", async ({ messages, type: upsertType }) => {
     try {
       const entries = [];
@@ -127,9 +156,6 @@ function bindStore(sock, sessionId, logger) {
         if (!m.key?.remoteJid || !m.key?.id) continue;
         const type = extractMessageType(m);
         const ts = Number(m.messageTimestamp || Date.now() / 1000);
-
-        // Auto-download media only for live incoming messages (not bulk history
-        // replay) to avoid hammering disk/bandwidth on first-ever sync.
         let mediaInfo = null;
         if (upsertType === "notify" && MEDIA_TYPES.has(type)) {
           mediaInfo = await saveIncomingMedia(sessionId, m, type, logger);
@@ -156,8 +182,6 @@ function bindStore(sock, sessionId, logger) {
         });
       }
       if (entries.length) await messageRepo.upsertMany(sessionId, entries);
-      // touchLastMessage upserts + creates the chat row if it doesn't exist yet,
-      // matching the original $set + $setOnInsert(isGroup) bulk-write behavior.
       for (const t of chatTouches) {
         await chatRepo.touchLastMessage(sessionId, t.jid, {
           lastMessageId: t.lastMessageId,
@@ -175,15 +199,7 @@ function bindStore(sock, sessionId, logger) {
         if (!key?.id) continue;
         const patch = {};
         if (update.status !== undefined) {
-          // Baileys WAMessageStatus: 0 error,1 pending,2 server_ack,3 delivery_ack,4 read,5 played
-          const map = {
-            0: "failed",
-            1: "pending",
-            2: "sent",
-            3: "delivered",
-            4: "read",
-            5: "played",
-          };
+          const map = { 0: "failed", 1: "pending", 2: "sent", 3: "delivered", 4: "read", 5: "played" };
           patch.status = map[update.status] || "sent";
         }
         if (update.message === null) {
@@ -191,12 +207,7 @@ function bindStore(sock, sessionId, logger) {
           patch.status = "revoked";
         }
         if (Object.keys(patch).length) {
-          await messageRepo.updateByKey(
-            sessionId,
-            key.remoteJid,
-            key.id,
-            patch,
-          );
+          await messageRepo.updateByKey(sessionId, key.remoteJid, key.id, patch);
         }
       }
     } catch (err) {
@@ -209,17 +220,13 @@ function bindStore(sock, sessionId, logger) {
       if ("all" in item && item.all) {
         await messageRepo.markDeletedForChat(sessionId, item.jid);
       } else if (item.keys) {
-        await messageRepo.markDeletedByIds(
-          sessionId,
-          item.keys.map((k) => k.id),
-        );
+        await messageRepo.markDeletedByIds(sessionId, item.keys.map((k) => k.id));
       }
     } catch (err) {
       logger.error({ err }, "messages.delete persist failed");
     }
   });
 
-  // ---- Groups ----
   ev.on("groups.upsert", async (groups) => {
     try {
       for (const g of groups) {
@@ -247,69 +254,77 @@ function bindStore(sock, sessionId, logger) {
 
   ev.on("group-participants.update", async ({ id, participants, action }) => {
     try {
-      logger.info(
-        { groupId: id, participants, action },
-        "group-participants.update",
-      );
+      logger.info({ groupId: id, participants, action }, "group-participants.update");
       const group = await groupRepo.findOne(sessionId, id);
       if (!group) return;
       let list = group.participants || [];
       if (action === "add") {
-        for (const p of participants)
-          if (!list.find((x) => x.id === p)) list.push({ id: p, admin: null });
+        for (const p of participants) if (!list.find((x) => x.id === p)) list.push({ id: p, admin: null });
       } else if (action === "remove") {
         list = list.filter((x) => !participants.includes(x.id));
       } else if (action === "promote") {
-        list = list.map((x) =>
-          participants.includes(x.id) ? { ...x, admin: "admin" } : x,
-        );
+        list = list.map((x) => participants.includes(x.id) ? { ...x, admin: "admin" } : x);
       } else if (action === "demote") {
-        list = list.map((x) =>
-          participants.includes(x.id) ? { ...x, admin: null } : x,
-        );
+        list = list.map((x) => participants.includes(x.id) ? { ...x, admin: null } : x);
       }
       await groupRepo.updateParticipants(sessionId, id, list);
-      groupCache.delete(groupCacheKey(sessionId, id)); // force refresh next read
+      groupCache.delete(groupCacheKey(sessionId, id));
     } catch (err) {
       logger.error({ err }, "group-participants.update persist failed");
     }
   });
 
-  // ---- History sync ----
-  // Fires once (possibly in several chunks) after connecting when Baileys pulls
-  // the on-device chat/message/contact history WhatsApp sends over the wire.
-  ev.on(
-    "messaging-history.set",
-    async ({ chats, contacts, messages, isLatest, syncType, lidPnMappings }) => {
-      try {
-        logger.info(
-          {
-            chats: chats?.length || 0,
-            contacts: contacts?.length || 0,
-            messages: messages?.length || 0,
-            lidPnMappings: lidPnMappings?.length || 0,
-            isLatest,
-            syncType,
-          },
-          "messaging-history.set received",
-        );
+  ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest, syncType, lidPnMappings }) => {
+    const startedAt = Date.now();
+    try {
+      const chatList = (chats || []).filter(
+        (c) => c?.id && !c.id.endsWith("@broadcast") && !c.id.endsWith("@newsletter"),
+      );
 
-        // Persist the authoritative history LID mappings first. Some history
-        // entries are LID-only and cannot be converted without this metadata.
-        if (lidPnMappings?.length) {
-          await lidMappingRepo.upsertMany(sessionId, lidPnMappings);
-        }
-        if (chats?.length) ev.emit("chats.upsert", chats);
-        if (contacts?.length) ev.emit("contacts.upsert", contacts);
-        if (messages?.length)
-          ev.emit("messages.upsert", { messages, type: "append" });
-      } catch (err) {
-        logger.error({ err }, "messaging-history.set persist failed");
+      logger.info(
+        {
+          chats: chatList.length,
+          contacts: contacts?.length || 0,
+          messages: messages?.length || 0,
+          lidPnMappings: lidPnMappings?.length || 0,
+          isLatest,
+          syncType,
+        },
+        "messaging-history.set received",
+      );
+
+      if (lidPnMappings?.length) {
+        await lidMappingRepo.upsertMany(sessionId, lidPnMappings);
       }
-    },
-  );
 
-  // ---- Blocklist ----
+      // Do NOT emit persistence events here. EventEmitter does not await async
+      // listeners, so the old implementation allowed the API to query Supabase
+      // before the history writes had finished. Persist the entire history
+      // synchronously first, then the normal live event handlers remain solely
+      // responsible for incremental updates.
+      if (chatList.length) await chatRepo.upsertMany(sessionId, chatList);
+      if (contacts?.length) {
+        await persistContactMappings(sessionId, contacts, logger);
+        await contactRepo.upsertMany(sessionId, contacts);
+      }
+      const persistedMessages = await persistHistoryMessages(sessionId, messages || []);
+
+      logger.info(
+        {
+          persistedChats: chatList.length,
+          persistedContacts: contacts?.length || 0,
+          persistedMessages,
+          durationMs: Date.now() - startedAt,
+          isLatest,
+          syncType,
+        },
+        "messaging-history.set persisted",
+      );
+    } catch (err) {
+      logger.error({ err, durationMs: Date.now() - startedAt }, "messaging-history.set persist failed");
+    }
+  });
+
   ev.on("blocklist.set", ({ blocklist }) => {
     logger.info({ count: blocklist.length }, "blocklist.set received");
   });
